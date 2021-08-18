@@ -6,8 +6,10 @@
 @version    : v1.0
 '''
 
+import re
 import json
 import time
+import logging
 import concurrent
 
 import requests
@@ -16,8 +18,8 @@ from pyquery import PyQuery as pq
 from sqlalchemy.engine import create_engine
 
 
-class HousePriceException(Exception):
-    """方便区分问题"""
+class NeedToRetry(Exception):
+    """方便处理可以通过重试解决的问题"""
     pass
 
 
@@ -45,7 +47,7 @@ def get_headers() -> str:
 
 
 def retry(retry_times):
-    """重试"""
+    """重试装饰器"""
     retry_times = retry_times
     if retry_times is None:
         retry_times = 5
@@ -57,11 +59,11 @@ def retry(retry_times):
                 try:
                     retry_ -= 1
                     return func(*args, **kwargs)
-                except HousePriceException as e1:  # 请求问题打印信息自动重试
+                except NeedToRetry as e1:  # 请求问题打印信息自动重试
                     time.sleep(1)
-                    print(f'[Request Aborted] {e1}\nbegin retrying ...')
+                    logging.error(f'[Request Aborted] {e1}\nbegin retrying ...')
 
-            print(f"[Retried Failed], info: {kwargs}")
+            logging.error(f"[Retried Failed], info: {kwargs}")
             return None  # 重试失败返回None
 
         return _wrapper
@@ -75,15 +77,15 @@ def get_address(address) -> tuple:
     try:
         address = address.replace("#", "&")  # type: str
     except Exception:
-        print('repalce_error:%s' % (address))
+        logging.error('repalce_error:%s' % (address))
 
     # 请求地址信息
     baidu_api = requests.get(
-        f'http://api.map.baidu.com/geocoding/v3/?address={address}&output=json&ak=So9Mbym2UKR9DR9VRNp0m9TxQ1l5sOk1'
+        f'url{address}'
     )
     baidu_location = json.loads(baidu_api.text)  # type: dict
     if baidu_location.get("status") != 0:
-        raise HousePriceException(  # 抛给重试函数处理
+        raise NeedToRetry(  # 抛给重试函数处理
             f'请求地址信息失败 code: {baidu_location.get("status")}')
 
     address_result = baidu_location.get("result")  # type: dict
@@ -109,25 +111,29 @@ def get_price(address) -> str:
     se = requests.session()
     se.headers.update(get_headers())
     price_api = se.get(
-        f'https://m.creprice.cn/ha/indexSearch.html?keyword={address}')
+        f'url{address}')
     if price_api.status_code != 200:  # 非api可能有反爬，抛给重试函数
-        raise HousePriceException(f'请求房源信息失败 code: {price_api.status_code}')
+        raise NeedToRetry(f'请求房源信息失败 code: {price_api.status_code}')
 
-    price_doc = pq(price_api.text)
+    price_doc = price_api.text
+    # 房源列表，只要第一个，将进行二次查询
+    price_detail_url = re.search(r'<li><a href="(.+)">', price_doc)
+    # price_datail =
     price_detail_url = price_doc('.searchlist a').attr('href')
     price_detail = price_doc('.cont_01 .data .fl span').html()
+    if price_detail_url is None:  # 有时候查询某个地址会失败，重试一次就又有了
+        raise NeedToRetry(f'查询房源信息失败，地址：{address}')
     if price_detail_url is not None:
         # 如果是房源选择界面，则需要请求第一个选项的
         price_api2 = se.get(price_detail_url)
         if price_api2.status_code != 200:  # 非api可能有反爬，抛给重试函数
-            raise HousePriceException(
-                f'请求房源详细信息页面失败 code: {price_api2.status_code}')
+            raise NeedToRetry(f'请求房源详细信息页面失败 code: {price_api2.status_code}')
         price_doc2 = pq(price_api2.text)
         price_detail = price_doc2(
             '.cont_01 .data .fl span').html()  # type: str
 
     if price_detail is None:  # 请求顺利但数据没有考虑是页面的问题
-        print(f"请求房价页面成功，但无法获取数据，将返回0，请检查返回页面，地址：{address}")
+        logging.error(f"请求房价页面成功，但无法获取数据，将返回0，请检查返回页面，地址：{address}")
         return 0
 
     try:
@@ -139,7 +145,7 @@ def get_price(address) -> str:
 def run(address: str) -> json:
     """隔离两个请求函数
     当某一个不成功时还能返回另一个的结果
-    其中不成功的重试后依然失败将返回None，最终信息为0
+    其中不成功的重试后依然失败将返回None，填充信息为默认值0
     """
     result = default()  # 默认格式
 
@@ -159,11 +165,10 @@ def run(address: str) -> json:
 if __name__ == '__main__':
     """多线程执行"""
     engine = create_engine(
-        'presto://analysis@presto-gateway-rancher-prodhd.inner.youdao.com:80/hive'
+        'schema'
     )
 
-    sql = """ --prefer(etl_market)
-        select * from temp.panzhj_baidu_request_today
+    sql = """ sql
         """
     address_basic = pd.read_sql(sql, engine)
     address_pool = [
@@ -171,7 +176,7 @@ if __name__ == '__main__':
     ]
 
     results = []
-    print("running...")
+    logging.error("running...")
     with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
         futures = [executor.submit(run, address) for address in address_pool]
         for future in concurrent.futures.as_completed(futures):
